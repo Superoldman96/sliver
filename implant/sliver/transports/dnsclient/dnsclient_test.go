@@ -21,6 +21,7 @@ package dnsclient
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log"
 	insecureRand "math/rand"
@@ -33,6 +34,18 @@ import (
 	"github.com/bishopfox/sliver/util/encoders"
 	"google.golang.org/protobuf/proto"
 )
+
+type errorEncoder struct {
+	err error
+}
+
+func (e errorEncoder) Encode([]byte) ([]byte, error) {
+	return nil, e.err
+}
+
+func (e errorEncoder) Decode([]byte) ([]byte, error) {
+	return nil, e.err
+}
 
 const (
 	// Do not change these without updating the tests
@@ -137,19 +150,37 @@ func TestSplitBufferBase32(t *testing.T) {
 	}
 }
 
-func TestSplitBufferParityRegression(t *testing.T) {
-	// Sweep parent domain lengths across 8 chars to cover the full base32 group
-	// period. The varint-boundary bug surfaces when msg.Data length crosses 128
-	// bytes: the proto varint grows from 1 to 2 bytes, causing a +3/+4 base32
-	// jump that exceeds the subdataSpace-1 guard in SplitBuffer.
-	base := "example.com"
-	for pad := 0; pad < 8; pad++ {
-		parent := fmt.Sprintf(".%s%s.", strings.Repeat("x", pad), base)
-		client := NewDNSClient(parent, opts)
-		testData := randomData(256) // crosses the 128-byte Data varint boundary
-		t.Run(fmt.Sprintf("parentLen%d", len(parent)), func(t *testing.T) {
-			clientSplitBuffer(t, client, encoders.Base32{}, testData)
-		})
+func TestSplitBufferVarintBoundary(t *testing.T) {
+	// At this parent length, growing msg.Data from 127 to 128 bytes makes the
+	// encoded protobuf jump from 215 to 218 bytes while only 217 bytes fit.
+	// SplitBuffer must step back before joining the encoded data to the parent.
+	parent := fmt.Sprintf(".%s.example.com.", strings.Repeat("x", 19))
+	client := NewDNSClient(parent, opts)
+	if client.subdataSpace != 217 {
+		t.Fatalf("Unexpected subdata space for parent %s: %d", parent, client.subdataSpace)
+	}
+	clientSplitBuffer(t, client, encoders.Base32{}, randomData(256))
+}
+
+func TestSplitBufferErrors(t *testing.T) {
+	client := NewDNSClient(parent1, opts)
+	if _, err := client.SplitBuffer(nil, encoders.Base32{}, []byte{1}); !errors.Is(err, ErrInvalidMsg) {
+		t.Fatalf("Expected %s, got %v", ErrInvalidMsg, err)
+	}
+
+	encodeErr := errors.New("encode failed")
+	msg := &dnspb.DNSMessage{Type: dnspb.DNSMessageType_DATA_FROM_IMPLANT, Size: 1}
+	if _, err := client.SplitBuffer(msg, errorEncoder{err: encodeErr}, []byte{1}); !errors.Is(err, encodeErr) {
+		t.Fatalf("Expected %s, got %v", encodeErr, err)
+	}
+
+	// Leave one encoded byte of space so no non-empty protobuf can fit.
+	client = NewDNSClient("."+strings.Repeat("a", 250)+".", opts)
+	if client.subdataSpace != 1 {
+		t.Fatalf("Unexpected subdata space: %d", client.subdataSpace)
+	}
+	if _, err := client.SplitBuffer(msg, encoders.Base32{}, []byte{1}); !errors.Is(err, errMsgTooLong) {
+		t.Fatalf("Expected %s, got %v", errMsgTooLong, err)
 	}
 }
 
