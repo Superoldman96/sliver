@@ -62,6 +62,9 @@ func GoHTTPDriver(origin string, secure bool, opts *HTTPOptions) (HTTPDriver, er
 			TLSClientConfig:     tlsConfig,
 		}
 	}
+	transport.ProxyConnectHeader = http.Header{
+		"User-Agent": []string{userAgent},
+	}
 	client := &http.Client{
 		Jar:       cookieJar(),
 		Timeout:   opts.NetTimeout,
